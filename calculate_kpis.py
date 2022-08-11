@@ -1,7 +1,8 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType
 from ast import literal_eval
-from pyspark.sql.functions import from_json, col, udf, when
+from pyspark.sql.functions import from_json, col, udf, when, window, round as pyspark_round, \
+    sum as pyspark_sum, count
 
 spark = SparkSession \
     .builder \
@@ -74,11 +75,53 @@ invoices_enriched = invoices \
     .withColumn("total_items", sum_items_udf("items")) \
     .select("invoice_no", "country", "timestamp", "total_cost", "total_items", "is_order", "is_return")
 
-invoices_enriched \
+time_country_based_kpis = invoices_enriched \
+    .withWatermark("timestamp", "1 minute") \
+    .groupBy(window("timestamp", "1 minute"), "country") \
+    .agg(pyspark_round(pyspark_sum("total_cost"), 2).alias("total_sales_volume"),
+         count("invoice_no").alias("OPM"),
+         pyspark_round(
+             pyspark_sum("is_return") / (pyspark_sum("is_return") + pyspark_sum("is_order")),
+             2).alias("rate_of_return"))
+
+time_based_kpis = invoices_enriched \
+    .withWatermark("timestamp", "1 minute") \
+    .groupBy(window("timestamp", "1 minute")) \
+    .agg(pyspark_round(pyspark_sum("total_cost"), 2).alias("total_sales_volume"),
+         count("invoice_no").alias("OPM"),
+         pyspark_round(
+             pyspark_sum("is_return") / (pyspark_sum("is_return") + pyspark_sum("is_order")),
+             2).alias("rate_of_return"),
+         pyspark_round(pyspark_sum("total_cost") / "OPM", 2).alias("average_transaction_size"))
+
+write_invoices_enriched = invoices_enriched \
     .writeStream \
     .outputMode("append") \
     .format("console") \
     .option("truncate", "false") \
     .trigger(processingTime="1 minute") \
-    .start() \
-    .awaitTermination()
+    .start()
+
+write_time_based_kpis = time_based_kpis \
+    .writeStream \
+    .outputMode("append") \
+    .format("json") \
+    .option("truncate", "false") \
+    .option("path", "/user/livy/calculate_kpis/time_based_kpis") \
+    .option("checkpointLocation", "hdfs:///user/livy/calculate_kpis/time_based_kpis/checkpoints") \
+    .trigger(processingTime="1 minute") \
+    .start()
+
+write_time_country_based_kpis = time_country_based_kpis \
+    .writeStream \
+    .outputMode("append") \
+    .format("json") \
+    .option("truncate", "false") \
+    .option("path", "/user/livy/calculate_kpis/time_country_based_kpis") \
+    .option("checkpointLocation", "hdfs:///user/livy/calculate_kpis/time_country_based_kpis/checkpoints") \
+    .trigger(processingTime="1 minute") \
+    .start()
+
+write_invoices_enriched.awaitTermination()
+write_time_based_kpis.awaitTermination()
+write_time_country_based_kpis.awaitTermination()
